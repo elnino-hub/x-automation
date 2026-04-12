@@ -99,16 +99,24 @@ _gql_cache: dict = {}
 _features_cache: dict = {}
 _transaction_ctx: ClientTransaction | None = None
 _cache_ts: float = 0
+_last_scrape_attempt: float = 0
 CACHE_TTL = 3600  # 1 hour
+SCRAPE_RETRY_COOLDOWN = 60  # seconds to wait after a failed scrape before retrying
 
 
 async def _scrape_gql_config() -> dict[str, str]:
     """Fetch current GraphQL queryIds, features, and transaction context from X's JS bundles."""
-    global _gql_cache, _features_cache, _transaction_ctx, _cache_ts
+    global _gql_cache, _features_cache, _transaction_ctx, _cache_ts, _last_scrape_attempt
 
     if _gql_cache and (time.time() - _cache_ts) < CACHE_TTL:
         return _gql_cache
 
+    # If the last scrape attempt failed recently, don't hammer the network
+    now = time.time()
+    if _last_scrape_attempt and (now - _last_scrape_attempt) < SCRAPE_RETRY_COOLDOWN:
+        return _gql_cache  # return empty dict; caller will use fallback
+
+    _last_scrape_attempt = now
     log.info("Scraping X JS bundles for fresh queryIds + features...")
     proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
 
@@ -199,6 +207,7 @@ async def _scrape_gql_config() -> dict[str, str]:
             if ops:
                 _gql_cache = ops
                 _cache_ts = time.time()
+                _last_scrape_attempt = 0  # reset so next cache expiry retries immediately
                 ct_id = ops.get("CreateTweet", "NOT FOUND")
                 log.info(f"Scraped {len(ops)} operations. CreateTweet={ct_id}")
             else:
@@ -435,9 +444,9 @@ async def post_tweet(payload: TweetRequest, _: str = Depends(verify_api_key)):
 
 @app.get("/health")
 async def health():
-    """Health check — also reports queryId status."""
-    query_id = await _get_create_tweet_id()
+    """Health check — reports current cache state without triggering a scrape."""
     features = _get_features()
+    query_id = _gql_cache.get("CreateTweet", FALLBACK_QUERY_ID)
     return {
         "status": "ok",
         "create_tweet_query_id": query_id,

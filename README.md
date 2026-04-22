@@ -25,6 +25,7 @@ This repository solves that by mapping a Python backend directly to X's internal
 ## 🌟 Features
 
 - **No Official API Required:** Runs entirely on session cookies (`auth_token` and `ct0`).
+- **Fully Stateless / Multi-Account:** Credentials are passed per-request — no env vars for secrets. One deployment supports any number of X accounts.
 - **Browser Fingerprinting:** Uses `curl_cffi` to mimic real Chrome (Chrome 136+) TLS patterns to bypass JA3/JA4 checks.
 - **Dynamic Session Extraction:** Auto-scrapes X's JavaScript bundles on startup to find the latest GraphQL `queryId` and `featureSwitches`.
 - **Resilient Scrape Retry Logic:** Failed bundle scrapes back off for 60 seconds before retrying — prevents retry storms on restricted networks (e.g. Render free tier).
@@ -48,30 +49,28 @@ pip install -r requirements.txt
 ```
 
 ### 3. Environment Variables
-Copy `.env.example` to a new `.env` file:
+The only server-level environment variable is the optional proxy:
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `PROXY_URL` | No (but strongly recommended on cloud) | Residential proxy URL — format: `http://user:pass@host:port` |
+
+Copy `.env.example` to `.env` and set `PROXY_URL` if needed:
 ```bash
 cp .env.example .env
 ```
-Fill in the variables:
 
-| Variable | Purpose |
-|---|---|
-| `X_AUTH_TOKEN` | `auth_token` cookie from a logged-in X browser session |
-| `X_CT0` | `ct0` cookie from a logged-in X browser session |
-| `API_KEY` | Secret key sent in the `x-api-key` header to authenticate requests securely |
-| `PROXY_URL` | (Required in cloud) Residential proxy URL — format: `http://user:pass@host:port` |
+> **X credentials (`auth_token` and `ct0`) are NOT stored in env vars.** They are passed dynamically in the JSON body of each request — see the endpoint docs below.
 
-> 🔑 **Important Note on `API_KEY`:**  
-> This is **NOT** an official X Developer API Key! Since this service bypasses X's API, this variable is simply a custom "password" you create right now to protect your own deployment from unauthorized access. You must send this exact string via the `x-api-key` header when making POST requests so random bots can't tweet from your server.  
-> *To generate a secure key, run `python -c "import secrets; print(secrets.token_hex(32))"` in your terminal, or simply type a long random string.*
+### 4. How to Get Your X Cookies
 
-**How to get your X Cookies:**
 1. Log in to [x.com](https://x.com) in your browser.
 2. Open DevTools (F12) → Application → Cookies → `https://x.com`.
 3. Copy the values for `auth_token` and `ct0`.
-*(Note: Cookies generally last ~12 months before needing rotation).*
 
-### 4. Run the Service
+*(Note: Cookies generally last ~12 months before needing rotation. You'll get a clear `AUTH_EXPIRED` error when they expire.)*
+
+### 5. Run the Service
 ```bash
 uvicorn execution.main:app --host 0.0.0.0 --port 8000
 ```
@@ -80,17 +79,34 @@ uvicorn execution.main:app --host 0.0.0.0 --port 8000
 
 ## 📡 Endpoints
 
-All mutating endpoints require your `API_KEY` to be passed in the `x-api-key` header.
+X credentials (`auth_token`, `ct0`) are passed in the JSON body of each request. No server-side secrets required.
 
 ### `POST /tweet`
-Post a tweet to the authenticated account.
+Post a tweet to any X account.
+
 **Request:**
 ```bash
 curl -X POST http://localhost:8000/tweet \
-  -H "x-api-key: YOUR_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"text": "Hello world from the unofficial API!"}'
+  -d '{
+    "auth_token": "YOUR_AUTH_TOKEN_COOKIE",
+    "ct0": "YOUR_CT0_COOKIE",
+    "text": "Hello world from the unofficial API!"
+  }'
 ```
+
+**With optional media URLs:**
+```bash
+curl -X POST http://localhost:8000/tweet \
+  -H "Content-Type: application/json" \
+  -d '{
+    "auth_token": "YOUR_AUTH_TOKEN_COOKIE",
+    "ct0": "YOUR_CT0_COOKIE",
+    "text": "Check out this image!",
+    "mediaUrls": ["https://example.com/image.jpg"]
+  }'
+```
+
 **Response:**
 ```json
 {
@@ -99,14 +115,24 @@ curl -X POST http://localhost:8000/tweet \
 }
 ```
 
+### `POST /debug-tweet`
+Fires a timestamped test tweet and returns the full raw X API response. Useful for verifying credentials and debugging.
+
+**Request:**
+```bash
+curl -X POST http://localhost:8000/debug-tweet \
+  -H "Content-Type: application/json" \
+  -d '{
+    "auth_token": "YOUR_AUTH_TOKEN_COOKIE",
+    "ct0": "YOUR_CT0_COOKIE"
+  }'
+```
+
 ### `GET /health`
 Returns the current cache state (queryId source, features, transaction context). No authentication required. Useful for Keep-Alive pings. **Does not trigger a bundle scrape** — reads from cache only, so pings are instant even when x.com is unreachable.
 
 ### `GET /ip`
 Returns the current outbound IP of the service. Highly recommended to verify your `PROXY_URL` is configured correctly.
-
-### `GET /debug-tweet`
-Fires a test tweet and returns the absolute raw response from X. Useful if something is breaking and you need to see exactly what X is returning.
 
 ---
 
@@ -118,14 +144,23 @@ This service is container-ready and runs on any Python hosting provider (Render,
 1. Create a new "Web Service" pointing to your fork.
 2. Build Command: `pip install -r requirements.txt`
 3. Start Command: `uvicorn execution.main:app --host 0.0.0.0 --port $PORT`
-4. Add all required secrets (`X_AUTH_TOKEN`, `X_CT0`, `API_KEY`, `PROXY_URL`) directly in the Render dashboard.
+4. Add `PROXY_URL` in the Render dashboard if using a residential proxy (strongly recommended).
+
+> No `X_AUTH_TOKEN`, `X_CT0`, or `API_KEY` environment variables needed — credentials are passed per-request.
 
 ## 🤖 n8n Workflow Integration
 To use this with n8n:
 - **Node:** HTTP Request
-- **URL:** `POST https://your-service-url.com/tweet`
-- **Header:** `key: x-api-key`, `value: <YOUR_API_KEY>`
-- **Body:** Send JSON with `{ "text": "Your tweet here" }`
+- **Method:** `POST`
+- **URL:** `https://your-service-url.com/tweet`
+- **Body (JSON):**
+  ```json
+  {
+    "auth_token": "{{ $env.X_AUTH_TOKEN }}",
+    "ct0": "{{ $env.X_CT0 }}",
+    "text": "{{ $json.tweet_text }}"
+  }
+  ```
 - **Settings:** Set a timeout of `60 seconds` (to handle cold starts). Set retries to `2 attempts` spaced `5000ms` apart.
 
 *(Pro-Tip: Set up a Cron trigger to hit `GET /health` every 14 minutes to prevent your cloud container from spinning down).*

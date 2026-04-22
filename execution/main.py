@@ -5,15 +5,15 @@ A FastAPI service that posts tweets to X (Twitter) via the internal GraphQL API,
 using curl_cffi for browser-grade TLS fingerprinting.
 
 Setup:
-    1. Copy .env.example to .env and fill in your values.
+    1. (Optional) Copy .env.example to .env and set PROXY_URL.
     2. pip install -r requirements.txt
     3. uvicorn execution.main:app --host 0.0.0.0 --port 8000
 
 Endpoints:
-    POST /tweet          — Post a tweet (requires x-api-key header)
+    POST /tweet          — Post a tweet (pass auth_token + ct0 in body)
+    POST /debug-tweet    — Post a test tweet and return raw X response
     GET  /health         — Service status and cache diagnostics
     GET  /ip             — Outbound IP (verify proxy routing)
-    GET  /debug-tweet    — Post a test tweet and return raw X response
 """
 
 import datetime
@@ -26,9 +26,8 @@ import uuid
 
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
-from fastapi import FastAPI, HTTPException, Security, Depends
-from fastapi.security.api_key import APIKeyHeader
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from x_client_transaction import ClientTransaction
 from x_client_transaction.constants import (
@@ -41,9 +40,6 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("x-automation")
 
-AUTH_TOKEN = os.environ["X_AUTH_TOKEN"]
-CT0 = os.environ["X_CT0"]
-API_KEY = os.environ["API_KEY"]
 PROXY_URL = os.environ.get("PROXY_URL")
 
 BROWSER = "chrome136"
@@ -248,7 +244,6 @@ def _get_features() -> dict:
 
 
 # ── App setup ───────────────────────────────────────────────────────
-api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 app = FastAPI(title="X Automation Service")
 
 
@@ -258,17 +253,11 @@ async def startup():
     await _scrape_gql_config()
 
 
-def verify_api_key(key: str = Security(api_key_header)):
-    if key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-    return key
-
-
-def _build_headers(method: str = "POST", path: str = "") -> dict:
+def _build_headers(auth_token: str, ct0: str, method: str = "POST", path: str = "") -> dict:
     headers = {
         "authorization": f"Bearer {BEARER}",
-        "cookie": f"auth_token={AUTH_TOKEN}; ct0={CT0}",
-        "x-csrf-token": CT0,
+        "cookie": f"auth_token={auth_token}; ct0={ct0}",
+        "x-csrf-token": ct0,
         "content-type": "application/json",
         "x-twitter-active-user": "yes",
         "x-twitter-auth-type": "OAuth2Session",
@@ -347,8 +336,10 @@ def _classify_error(data: dict, status_code: int) -> str:
 
 
 class TweetRequest(BaseModel):
-    text: str
-    mediaUrls: list[str] = []
+    auth_token: str = Field(..., description="auth_token cookie from your X browser session")
+    ct0: str = Field(..., description="ct0 cookie from your X browser session")
+    text: str = Field(..., description="Tweet content, max 280 characters")
+    mediaUrls: list[str] = Field(default=[], description="Public image URLs to attach")
 
 
 class TweetResponse(BaseModel):
@@ -357,7 +348,12 @@ class TweetResponse(BaseModel):
     error: str | None = None
 
 
-async def _attempt_tweet(text: str, query_id: str) -> dict:
+class DebugTweetRequest(BaseModel):
+    auth_token: str = Field(..., description="auth_token cookie from your X browser session")
+    ct0: str = Field(..., description="ct0 cookie from your X browser session")
+
+
+async def _attempt_tweet(text: str, query_id: str, auth_token: str, ct0: str) -> dict:
     """Fire a single CreateTweet request. Returns raw parsed JSON."""
     path = f"/i/api/graphql/{query_id}/CreateTweet"
     url = f"https://x.com{path}"
@@ -365,7 +361,10 @@ async def _attempt_tweet(text: str, query_id: str) -> dict:
     async with AsyncSession(impersonate=BROWSER, proxies=proxies) as session:
         body = _build_tweet_payload(text, query_id)
         resp = await session.post(
-            url, headers=_build_headers(method="POST", path=path), json=body, timeout=30
+            url,
+            headers=_build_headers(auth_token, ct0, method="POST", path=path),
+            json=body,
+            timeout=30,
         )
     return {"status_code": resp.status_code, "data": resp.json()}
 
@@ -381,11 +380,11 @@ def _extract_tweet_id(data: dict) -> str | None:
 
 
 @app.post("/tweet", response_model=TweetResponse)
-async def post_tweet(payload: TweetRequest, _: str = Depends(verify_api_key)):
+async def post_tweet(payload: TweetRequest):
     try:
         # Attempt 1: use cached queryId
         query_id = await _get_create_tweet_id()
-        result = await _attempt_tweet(payload.text, query_id)
+        result = await _attempt_tweet(payload.text, query_id, payload.auth_token, payload.ct0)
         data = result["data"]
         status = result["status_code"]
 
@@ -411,7 +410,7 @@ async def post_tweet(payload: TweetRequest, _: str = Depends(verify_api_key)):
         new_query_id = await _get_create_tweet_id(force_refresh=True)
 
         log.info(f"queryId: {query_id} → {new_query_id}. Retrying...")
-        result = await _attempt_tweet(payload.text, new_query_id)
+        result = await _attempt_tweet(payload.text, new_query_id, payload.auth_token, payload.ct0)
         data = result["data"]
         status = result["status_code"]
 
@@ -466,8 +465,8 @@ async def check_ip():
         return {"proxy_configured": bool(PROXY_URL), "ip": resp.json()}
 
 
-@app.get("/debug-tweet")
-async def debug_tweet(_: str = Depends(verify_api_key)):
+@app.post("/debug-tweet")
+async def debug_tweet(payload: DebugTweetRequest):
     """Fire a test tweet and return the full raw X response for debugging."""
     text = f"debug {datetime.datetime.utcnow().isoformat()}"
     query_id = await _get_create_tweet_id()
@@ -477,7 +476,10 @@ async def debug_tweet(_: str = Depends(verify_api_key)):
     async with AsyncSession(impersonate=BROWSER, proxies=proxies) as session:
         body = _build_tweet_payload(text, query_id)
         resp = await session.post(
-            url, headers=_build_headers(method="POST", path=path), json=body, timeout=30
+            url,
+            headers=_build_headers(payload.auth_token, payload.ct0, method="POST", path=path),
+            json=body,
+            timeout=30,
         )
     return {
         "status_code": resp.status_code,

@@ -11,6 +11,7 @@ Setup:
 
 Endpoints:
     POST /tweet          — Post a tweet (requires x-api-key header)
+    GET  /feed           — Fetch the Home Timeline (requires x-api-key header)
     GET  /health         — Service status and cache diagnostics
     GET  /ip             — Outbound IP (verify proxy routing)
     GET  /debug-tweet    — Post a test tweet and return raw X response
@@ -57,6 +58,7 @@ BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk
 # ── Dynamic GraphQL config ──────────────────────────────────────────
 # Scraped at runtime from X's JS bundles. Fallback to last-known-good.
 FALLBACK_QUERY_ID = "S1qcGUn68_U0lDKdMlYSGg"
+FALLBACK_TIMELINE_ID = "38_vsk992mI6Y9IisAovOQ"
 FALLBACK_FEATURES = {
     "premium_content_api_read_enabled": False,
     "communities_web_enable_tweet_community_results_fetch": True,
@@ -209,7 +211,8 @@ async def _scrape_gql_config() -> dict[str, str]:
                 _cache_ts = time.time()
                 _last_scrape_attempt = 0  # reset so next cache expiry retries immediately
                 ct_id = ops.get("CreateTweet", "NOT FOUND")
-                log.info(f"Scraped {len(ops)} operations. CreateTweet={ct_id}")
+                tl_id = ops.get("HomeTimeline", "NOT FOUND")
+                log.info(f"Scraped {len(ops)} operations. CreateTweet={ct_id}, HomeTimeline={tl_id}")
             else:
                 log.warning(
                     "Bundle scrape returned 0 operations, keeping cache/fallback"
@@ -245,6 +248,43 @@ async def _get_create_tweet_id(force_refresh: bool = False) -> str:
 def _get_features() -> dict:
     """Return the best available features dict."""
     return _features_cache if _features_cache else FALLBACK_FEATURES
+
+
+async def _get_timeline_id(force_refresh: bool = False) -> str:
+    """Return the current HomeTimeline queryId."""
+    global _gql_cache, _cache_ts
+
+    if force_refresh:
+        _cache_ts = 0  # bust cache
+
+    ops = await _scrape_gql_config()
+    qid = ops.get("HomeTimeline")
+    if qid:
+        return qid
+
+    log.warning("HomeTimeline not found in scraped ops, using fallback")
+    return FALLBACK_TIMELINE_ID
+
+
+def _build_timeline_payload(query_id: str, count: int = 20) -> dict:
+    """Build the GraphQL variables for a HomeTimeline fetch."""
+    return {
+        "variables": {
+            "count": count,
+            "includePromotedContent": False,
+            "latestControlAvailable": True,
+            "requestContext": "launch",
+        },
+        "features": _get_features(),
+        "queryId": query_id,
+    }
+
+
+class TimelineEntry(BaseModel):
+    tweet_id: str
+    text: str
+    author_handle: str
+    author_id: str
 
 
 # ── App setup ───────────────────────────────────────────────────────
@@ -488,3 +528,59 @@ async def debug_tweet(_: str = Depends(verify_api_key)):
         "transaction_id_active": _transaction_ctx is not None,
         "tweet_text": text,
     }
+
+
+@app.get("/feed", response_model=list[TimelineEntry])
+async def get_feed(_: str = Depends(verify_api_key)):
+    """Fetch the Home Timeline via GraphQL. Returns a list of tweets."""
+    query_id = await _get_timeline_id()
+    path = f"/i/api/graphql/{query_id}/HomeTimeline"
+    url = f"https://x.com{path}"
+    proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
+    body = _build_timeline_payload(query_id)
+
+    async with AsyncSession(impersonate=BROWSER, proxies=proxies) as session:
+        resp = await session.post(
+            url, headers=_build_headers(method="GET", path=path), json=body, timeout=30
+        )
+        data = resp.json()
+
+    if resp.status_code != 200:
+        err = _classify_error(data, resp.status_code)
+        raise HTTPException(status_code=resp.status_code, detail=err or f"X API {resp.status_code}")
+
+    # Walk the instructions array and extract timeline entries
+    instructions = (
+        data.get("data", {})
+        .get("home", {})
+        .get("home_timeline", {})
+        .get("instructions", [])
+    )
+
+    entries: list[TimelineEntry] = []
+    for instr in instructions:
+        # Skip ads / promoted content
+        entry_type = instr.get("type", "")
+        if entry_type == "TimelineAddEntries":
+            for item in instr.get("entries", []):
+                item_type = item.get("entryId", "")
+                if item_type.startswith("tweet-"):
+                    tweet = item.get("content", {}).get("tweet", {})
+                    legacy = tweet.get("legacy", {})
+                    user = tweet.get("core", {}).get("user_results", {}).get("result", {})
+                    screen_name = user.get("legacy", {}).get("screen_name", "")
+                    user_id = str(user.get("rest_id", ""))
+                    tweet_id = str(tweet.get("rest_id", ""))
+                    full_text = legacy.get("full_text", "")
+                    entries.append(
+                        TimelineEntry(
+                            tweet_id=tweet_id,
+                            text=full_text,
+                            author_handle=screen_name,
+                            author_id=user_id,
+                        )
+                    )
+                elif item_type.startswith("cursor-show-more-"):
+                    continue  # pagination cursors, skip
+
+    return entries

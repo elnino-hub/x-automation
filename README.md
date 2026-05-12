@@ -30,6 +30,8 @@ This repository solves that by mapping a Python backend directly to X's internal
 - **Resilient Scrape Retry Logic:** Failed bundle scrapes back off for 60 seconds before retrying — prevents retry storms on restricted networks (e.g. Render free tier).
 - **Advanced Header Management:** Dynamically generates `x-client-transaction-id` and maintains a stable `x-client-uuid` per session.
 - **Actionable Error Handling:** Cleans up ambiguous X API errors into readable flags (`AUTH_EXPIRED`, `RATE_LIMIT`, `DUPLICATE_TWEET`, `AUTOMATION_DETECTED`).
+- **Home Timeline Feed:** Fetch your Home Timeline via `GET /feed` — returns tweet text, author, engagement metrics, and timestamps.
+- **Threaded Replies:** Post replies to any tweet by passing `reply_to_tweet_id` to `POST /tweet`.
 - **n8n / Make Friendly:** Perfect for triggering from any workflow automation tool via a simple POST request.
 
 ---
@@ -83,7 +85,7 @@ uvicorn execution.main:app --host 0.0.0.0 --port 8000
 All mutating endpoints require your `API_KEY` to be passed in the `x-api-key` header.
 
 ### `POST /tweet`
-Post a tweet to the authenticated account.
+Post a tweet to the authenticated account. Supports optional threaded replies.
 **Request:**
 ```bash
 curl -X POST http://localhost:8000/tweet \
@@ -91,12 +93,42 @@ curl -X POST http://localhost:8000/tweet \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello world from the unofficial API!"}'
 ```
+**Reply to a tweet:**
+```bash
+curl -X POST http://localhost:8000/tweet \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Great thread!", "reply_to_tweet_id": "1234567890123456789"}'
+```
 **Response:**
 ```json
 {
   "success": true,
   "tweet_id": "184719247192847120"
 }
+```
+
+### `GET /feed`
+Fetch the authenticated account's Home Timeline. Returns a list of tweets with engagement metrics.
+**Request:**
+```bash
+curl http://localhost:8000/feed \
+  -H "x-api-key: YOUR_API_KEY"
+```
+**Response:**
+```json
+[
+  {
+    "tweet_id": "2054004712773414965",
+    "text": "If you want to donate hardware or funds to FFmpeg...",
+    "author_handle": "FFmpeg",
+    "author_id": "1283902819",
+    "reply_count": 1,
+    "favorite_count": 8,
+    "retweet_count": 0,
+    "created_at": "Tue May 12 01:04:19 +0000 2026"
+  }
+]
 ```
 
 ### `GET /health`

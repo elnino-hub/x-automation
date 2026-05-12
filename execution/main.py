@@ -601,7 +601,7 @@ async def get_feed(_: str = Depends(verify_api_key)):
                     .get("user_results", {})
                     .get("result", {})
                 )
-                screen_name = user.get("legacy", {}).get("screen_name", "")
+                screen_name = user.get("core", {}).get("screen_name", "")
                 user_id = user.get("rest_id", "")
                 tweet_id = str(tweet_results.get("rest_id", ""))
                 full_text = legacy.get("full_text", "")

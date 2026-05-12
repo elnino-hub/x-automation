@@ -285,6 +285,10 @@ class TimelineEntry(BaseModel):
     text: str
     author_handle: str
     author_id: str
+    reply_count: int = 0
+    favorite_count: int = 0
+    retweet_count: int = 0
+    created_at: str | None = None
 
 
 # ── App setup ───────────────────────────────────────────────────────
@@ -453,6 +457,10 @@ async def post_tweet(payload: TweetRequest, _: str = Depends(verify_api_key)):
         # Try to extract tweet_id first — X may include both errors AND a valid result
         tweet_id = _extract_tweet_id(data)
         if tweet_id:
+            if payload.reply_to_tweet_id:
+                log.info(
+                    f"Successfully replied to tweet {payload.reply_to_tweet_id} with tweet {tweet_id}"
+                )
             return TweetResponse(success=True, tweet_id=tweet_id)
 
         # No tweet_id found — check for explicit errors
@@ -479,6 +487,10 @@ async def post_tweet(payload: TweetRequest, _: str = Depends(verify_api_key)):
 
         tweet_id = _extract_tweet_id(data)
         if tweet_id:
+            if payload.reply_to_tweet_id:
+                log.info(
+                    f"Successfully replied to tweet {payload.reply_to_tweet_id} with tweet {tweet_id}"
+                )
             return TweetResponse(success=True, tweet_id=tweet_id)
 
         if "errors" in data:
@@ -505,9 +517,11 @@ async def health():
     """Health check — reports current cache state without triggering a scrape."""
     features = _get_features()
     query_id = _gql_cache.get("CreateTweet", FALLBACK_QUERY_ID)
+    timeline_id = _gql_cache.get("HomeTimeline", FALLBACK_TIMELINE_ID)
     return {
         "status": "ok",
         "create_tweet_query_id": query_id,
+        "home_timeline_query_id": timeline_id,
         "query_id_source": "scraped" if _gql_cache else "fallback",
         "features_source": "scraped" if _features_cache else "fallback",
         "features_count": len(features),
@@ -578,62 +592,50 @@ async def get_feed(_: str = Depends(verify_api_key)):
 
     entries: list[TimelineEntry] = []
     for instr in instructions:
-        entry_type = instr.get("type", "")
-        if entry_type == "TimelineAddEntries":
+        try:
+            entry_type = instr.get("type", "")
+            if entry_type not in ("TimelineAddEntries", "TimelinePinEntry"):
+                continue
             for item in instr.get("entries", []):
-                item_id = item.get("entryId", "")
-                # Skip promoted/ads and cursor entries
-                if item_id.startswith("promoted-tweet-") or item_id.startswith("cursor-"):
-                    continue
-                if not item_id.startswith("tweet-"):
-                    continue
-                content = item.get("content", {})
-                tweet_results = (
-                    content.get("itemContent", {})
-                    .get("tweet_results", {})
-                    .get("result", {})
-                )
-                if not tweet_results:
-                    continue
-                legacy = tweet_results.get("legacy", {})
-                user = (
-                    tweet_results.get("core", {})
-                    .get("user_results", {})
-                    .get("result", {})
-                )
-                screen_name = user.get("core", {}).get("screen_name", "")
-                user_id = user.get("rest_id", "")
-                tweet_id = str(tweet_results.get("rest_id", ""))
-                full_text = legacy.get("full_text", "")
-                entries.append(
-                    TimelineEntry(
-                        tweet_id=tweet_id,
-                        text=full_text,
-                        author_handle=screen_name,
-                        author_id=user_id,
+                try:
+                    item_id = item.get("entryId", "")
+                    if item_id.startswith("promoted-tweet-") or item_id.startswith("cursor-") or item_id.startswith("conversationThread-"):
+                        continue
+                    if not item_id.startswith("tweet-"):
+                        continue
+                    content = item.get("content", {})
+                    tweet_results = (
+                        content.get("itemContent", {})
+                        .get("tweet_results", {})
+                        .get("result", {})
                     )
-                )
+                    if not tweet_results:
+                        continue
+                    legacy = tweet_results.get("legacy", {})
+                    user = (
+                        tweet_results.get("core", {})
+                        .get("user_results", {})
+                        .get("result", {})
+                    )
+                    screen_name = user.get("core", {}).get("screen_name", "")
+                    user_id = user.get("rest_id", "")
+                    tweet_id = str(tweet_results.get("rest_id", ""))
+                    full_text = legacy.get("full_text", "")
+                    entries.append(
+                        TimelineEntry(
+                            tweet_id=tweet_id,
+                            text=full_text,
+                            author_handle=screen_name,
+                            author_id=user_id,
+                            reply_count=legacy.get("reply_count", 0),
+                            favorite_count=legacy.get("favorite_count", 0),
+                            retweet_count=legacy.get("retweet_count", 0),
+                            created_at=legacy.get("created_at"),
+                        )
+                    )
+                except Exception:
+                    continue
+        except Exception:
+            continue
 
     return entries
-
-
-@app.get("/debug-feed")
-async def debug_feed(_: str = Depends(verify_api_key)):
-    """Fetch the Home Timeline and return the raw X response for debugging."""
-    query_id = await _get_timeline_id()
-    path = f"/i/api/graphql/{query_id}/HomeTimeline"
-    url = f"https://x.com{path}"
-    proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
-    body = _build_timeline_payload(query_id)
-
-    async with AsyncSession(impersonate=BROWSER, proxies=proxies) as session:
-        resp = await session.post(
-            url, headers=_build_headers(method="GET", path=path), json=body, timeout=30
-        )
-        data = resp.json()
-
-    return {
-        "status_code": resp.status_code,
-        "response": data,
-        "query_id_used": query_id,
-    }

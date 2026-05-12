@@ -335,22 +335,33 @@ def _build_headers(method: str = "POST", path: str = "") -> dict:
 
 
 def _build_tweet_payload(
-    text: str, query_id: str, media_ids: list[str] | None = None
+    text: str,
+    query_id: str,
+    media_ids: list[str] | None = None,
+    reply_to_tweet_id: str | None = None,
 ) -> dict:
     media_entities = []
     if media_ids:
         media_entities = [{"media_id": mid, "tagged_users": []} for mid in media_ids]
 
-    return {
-        "variables": {
-            "tweet_text": text,
-            "dark_request": False,
-            "media": {
-                "media_entities": media_entities,
-                "possibly_sensitive": False,
-            },
-            "semantic_annotation_ids": [],
+    variables: dict = {
+        "tweet_text": text,
+        "dark_request": False,
+        "media": {
+            "media_entities": media_entities,
+            "possibly_sensitive": False,
         },
+        "semantic_annotation_ids": [],
+    }
+
+    if reply_to_tweet_id:
+        variables["reply"] = {
+            "in_reply_to_tweet_id": reply_to_tweet_id,
+            "exclude_reply_user_ids": [],
+        }
+
+    return {
+        "variables": variables,
         "features": _get_features(),
         "queryId": query_id,
     }
@@ -389,6 +400,7 @@ def _classify_error(data: dict, status_code: int) -> str:
 class TweetRequest(BaseModel):
     text: str
     mediaUrls: list[str] = []
+    reply_to_tweet_id: str | None = None
 
 
 class TweetResponse(BaseModel):
@@ -397,13 +409,15 @@ class TweetResponse(BaseModel):
     error: str | None = None
 
 
-async def _attempt_tweet(text: str, query_id: str) -> dict:
+async def _attempt_tweet(
+    text: str, query_id: str, reply_to_tweet_id: str | None = None
+) -> dict:
     """Fire a single CreateTweet request. Returns raw parsed JSON."""
     path = f"/i/api/graphql/{query_id}/CreateTweet"
     url = f"https://x.com{path}"
     proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
     async with AsyncSession(impersonate=BROWSER, proxies=proxies) as session:
-        body = _build_tweet_payload(text, query_id)
+        body = _build_tweet_payload(text, query_id, reply_to_tweet_id=reply_to_tweet_id)
         resp = await session.post(
             url, headers=_build_headers(method="POST", path=path), json=body, timeout=30
         )
@@ -425,7 +439,9 @@ async def post_tweet(payload: TweetRequest, _: str = Depends(verify_api_key)):
     try:
         # Attempt 1: use cached queryId
         query_id = await _get_create_tweet_id()
-        result = await _attempt_tweet(payload.text, query_id)
+        result = await _attempt_tweet(
+            payload.text, query_id, reply_to_tweet_id=payload.reply_to_tweet_id
+        )
         data = result["data"]
         status = result["status_code"]
 
@@ -451,7 +467,9 @@ async def post_tweet(payload: TweetRequest, _: str = Depends(verify_api_key)):
         new_query_id = await _get_create_tweet_id(force_refresh=True)
 
         log.info(f"queryId: {query_id} → {new_query_id}. Retrying...")
-        result = await _attempt_tweet(payload.text, new_query_id)
+        result = await _attempt_tweet(
+            payload.text, new_query_id, reply_to_tweet_id=payload.reply_to_tweet_id
+        )
         data = result["data"]
         status = result["status_code"]
 
@@ -507,7 +525,10 @@ async def check_ip():
 
 
 @app.get("/debug-tweet")
-async def debug_tweet(_: str = Depends(verify_api_key)):
+async def debug_tweet(
+    _: str = Depends(verify_api_key),
+    reply_to: str | None = None,
+):
     """Fire a test tweet and return the full raw X response for debugging."""
     text = f"debug {datetime.datetime.utcnow().isoformat()}"
     query_id = await _get_create_tweet_id()
@@ -515,7 +536,7 @@ async def debug_tweet(_: str = Depends(verify_api_key)):
     url = f"https://x.com{path}"
     proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
     async with AsyncSession(impersonate=BROWSER, proxies=proxies) as session:
-        body = _build_tweet_payload(text, query_id)
+        body = _build_tweet_payload(text, query_id, reply_to_tweet_id=reply_to)
         resp = await session.post(
             url, headers=_build_headers(method="POST", path=path), json=body, timeout=30
         )
@@ -527,6 +548,7 @@ async def debug_tweet(_: str = Depends(verify_api_key)):
         "features_source": "scraped" if _features_cache else "fallback",
         "transaction_id_active": _transaction_ctx is not None,
         "tweet_text": text,
+        "reply_to": reply_to,
     }
 
 

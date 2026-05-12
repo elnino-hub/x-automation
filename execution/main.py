@@ -572,37 +572,68 @@ async def get_feed(_: str = Depends(verify_api_key)):
         raise HTTPException(status_code=resp.status_code, detail=err or f"X API {resp.status_code}")
 
     # Walk the instructions array and extract timeline entries
-    instructions = (
-        data.get("data", {})
-        .get("home", {})
-        .get("home_timeline", {})
-        .get("instructions", [])
-    )
+    home_data = data.get("data", {}).get("home", {})
+    home_timeline = home_data.get("home_timeline_urt", {}) if home_data else {}
+    instructions = home_timeline.get("instructions", []) if home_timeline else []
 
     entries: list[TimelineEntry] = []
     for instr in instructions:
-        # Skip ads / promoted content
         entry_type = instr.get("type", "")
         if entry_type == "TimelineAddEntries":
             for item in instr.get("entries", []):
-                item_type = item.get("entryId", "")
-                if item_type.startswith("tweet-"):
-                    tweet = item.get("content", {}).get("tweet", {})
-                    legacy = tweet.get("legacy", {})
-                    user = tweet.get("core", {}).get("user_results", {}).get("result", {})
-                    screen_name = user.get("legacy", {}).get("screen_name", "")
-                    user_id = str(user.get("rest_id", ""))
-                    tweet_id = str(tweet.get("rest_id", ""))
-                    full_text = legacy.get("full_text", "")
-                    entries.append(
-                        TimelineEntry(
-                            tweet_id=tweet_id,
-                            text=full_text,
-                            author_handle=screen_name,
-                            author_id=user_id,
-                        )
+                item_id = item.get("entryId", "")
+                # Skip promoted/ads and cursor entries
+                if item_id.startswith("promoted-tweet-") or item_id.startswith("cursor-"):
+                    continue
+                if not item_id.startswith("tweet-"):
+                    continue
+                content = item.get("content", {})
+                tweet_results = (
+                    content.get("itemContent", {})
+                    .get("tweet_results", {})
+                    .get("result", {})
+                )
+                if not tweet_results:
+                    continue
+                legacy = tweet_results.get("legacy", {})
+                user = (
+                    tweet_results.get("core", {})
+                    .get("user_results", {})
+                    .get("result", {})
+                )
+                screen_name = user.get("legacy", {}).get("screen_name", "")
+                user_id = user.get("rest_id", "")
+                tweet_id = str(tweet_results.get("rest_id", ""))
+                full_text = legacy.get("full_text", "")
+                entries.append(
+                    TimelineEntry(
+                        tweet_id=tweet_id,
+                        text=full_text,
+                        author_handle=screen_name,
+                        author_id=user_id,
                     )
-                elif item_type.startswith("cursor-show-more-"):
-                    continue  # pagination cursors, skip
+                )
 
     return entries
+
+
+@app.get("/debug-feed")
+async def debug_feed(_: str = Depends(verify_api_key)):
+    """Fetch the Home Timeline and return the raw X response for debugging."""
+    query_id = await _get_timeline_id()
+    path = f"/i/api/graphql/{query_id}/HomeTimeline"
+    url = f"https://x.com{path}"
+    proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
+    body = _build_timeline_payload(query_id)
+
+    async with AsyncSession(impersonate=BROWSER, proxies=proxies) as session:
+        resp = await session.post(
+            url, headers=_build_headers(method="GET", path=path), json=body, timeout=30
+        )
+        data = resp.json()
+
+    return {
+        "status_code": resp.status_code,
+        "response": data,
+        "query_id_used": query_id,
+    }

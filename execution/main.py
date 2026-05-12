@@ -577,7 +577,7 @@ async def get_feed(_: str = Depends(verify_api_key)):
 
     async with AsyncSession(impersonate=BROWSER, proxies=proxies) as session:
         resp = await session.post(
-            url, headers=_build_headers(method="GET", path=path), json=body, timeout=30
+            url, headers=_build_headers(method="POST", path=path), json=body, timeout=30
         )
         data = resp.json()
 
